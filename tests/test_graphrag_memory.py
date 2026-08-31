@@ -11,6 +11,7 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1] / "hy-memory-1.2.21"
 sys.path.insert(0, str(SOURCE_ROOT))
 
 from hy_memory.agent.reconciler import ReconcileOp
+from hy_memory.client import _serialize_search_memory
 from hy_memory.data.graph_store_kuzu import KuzuGraphStore
 from hy_memory.models.graph_memory import sanitize_relation_candidates
 from hy_memory.models.memory import MemoryLayer, MemoryNode
@@ -57,6 +58,26 @@ def test_relation_candidates_are_conservative_and_require_provenance():
     assert accepted[0]["object_normalized"] == "小林"
     assert accepted[0]["source_turn_ids"] == ["D1:turn:2"]
     assert sanitize_relation_candidates(raw[:1], source_turn_ids=[]) == []
+
+
+def test_public_search_serialization_preserves_graph_provenance():
+    serialized = _serialize_search_memory({
+        "memory_id": "fact-2",
+        "content": "小林是用户的同事。",
+        "score": 0.75,
+        "layer": "l2_fact",
+        "retrieval_source": "entity_fact_graph",
+        "graph_hop": 2,
+        "graph_anchor_fact_id": "fact-1",
+        "graph_confidence": 0.91,
+        "graph_path": [{"predicate": "COLLEAGUE_OF"}],
+    })
+
+    assert serialized["retrieval_source"] == "entity_fact_graph"
+    assert serialized["graph_hop"] == 2
+    assert serialized["graph_anchor_fact_id"] == "fact-1"
+    assert serialized["graph_confidence"] == 0.91
+    assert serialized["graph_path"] == [{"predicate": "COLLEAGUE_OF"}]
 
 
 def test_reconciler_source_indices_govern_relation_publication():
@@ -254,6 +275,9 @@ async def test_legacy_reader_graph_expansion_respects_shadow_mode(
     assert response.total_found == expected_count
     assert response.extra["graphrag"]["evidence_count"] == 1
     assert response.extra["graphrag"]["added_count"] == (0 if shadow_mode else 1)
+    assert response.extra["graphrag"]["returned_count"] == (
+        0 if shadow_mode else 1
+    )
     if shadow_mode:
         assert {item["memory_id"] for item in response.memories} == {"anchor-fact"}
     else:

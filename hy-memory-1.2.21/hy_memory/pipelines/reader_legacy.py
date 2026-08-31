@@ -746,6 +746,13 @@ class LegacyReadPipeline(ReadPipeline):
                     final_normal = final_normal[:limit]
 
                     final_results = final_profile + final_proactive + final_normal
+                    # `added_count` describes graph hits offered to fusion;
+                    # after fixed-budget top-k truncation only some may actually
+                    # reach the public response.  Report both numbers.
+                    if "graphrag" in response.extra:
+                        response.extra["graphrag"]["returned_count"] = sum(
+                            bool(item.get("graph_added")) for item in final_results
+                        )
 
                     # 填充结果
                     top_scores = []

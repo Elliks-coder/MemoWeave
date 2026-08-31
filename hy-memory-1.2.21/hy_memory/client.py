@@ -99,6 +99,18 @@ def _serialize_search_memory(mem: Dict[str, Any]) -> Dict[str, Any]:
     for field_name in ("schema_type", "workspace_id", "branch", "evolution_chain"):
         if mem.get(field_name):
             item[field_name] = mem[field_name]
+    # Preserve GraphRAG provenance in the public response.  Without these
+    # fields an added graph fact is indistinguishable from a vector hit, which
+    # makes shadow audits and retrieval A/B analysis impossible.
+    for field_name in (
+        "retrieval_source",
+        "graph_hop",
+        "graph_anchor_fact_id",
+        "graph_confidence",
+        "graph_path",
+    ):
+        if mem.get(field_name) is not None:
+            item[field_name] = mem[field_name]
     return item
 
 
@@ -2402,6 +2414,7 @@ class HyMemoryClient:
             "request_id": request_id,
             "memories": memories,
             "fallback": result.extra.get("zero_result_fallback"),
+            "graphrag": result.extra.get("graphrag"),
             "rewrite": {
                 "used": rewrite_used,
                 "original_query": target_query,

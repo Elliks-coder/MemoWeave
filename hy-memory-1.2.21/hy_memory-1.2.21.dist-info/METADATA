@@ -1,0 +1,171 @@
+Metadata-Version: 2.4
+Name: hy-memory
+Version: 1.2.21
+Summary: HY Memory - Industrial-grade dual-system cognitive memory framework
+Author: alvinfei
+License: MIT
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: pydantic
+Requires-Dist: numpy
+Requires-Dist: openai<3,>=1.40
+Requires-Dist: python-dotenv
+Requires-Dist: pyyaml
+Requires-Dist: chromadb>=1.5.9
+Requires-Dist: kuzu
+Requires-Dist: langdetect
+Requires-Dist: scikit-learn
+Requires-Dist: tiktoken
+Requires-Dist: json-repair
+Provides-Extra: qdrant
+Requires-Dist: qdrant-client; extra == "qdrant"
+Requires-Dist: fastembed; extra == "qdrant"
+Provides-Extra: faiss
+Requires-Dist: faiss-cpu; extra == "faiss"
+Provides-Extra: graph
+Requires-Dist: neo4j; extra == "graph"
+Provides-Extra: mysql
+Requires-Dist: aiomysql; extra == "mysql"
+Provides-Extra: tencent
+Requires-Dist: tcvectordb; extra == "tencent"
+Requires-Dist: tcvdb_text; extra == "tencent"
+Provides-Extra: all
+Requires-Dist: chromadb>=1.5.9; extra == "all"
+Requires-Dist: qdrant-client; extra == "all"
+Requires-Dist: fastembed; extra == "all"
+Requires-Dist: faiss-cpu; extra == "all"
+Requires-Dist: kuzu; extra == "all"
+Requires-Dist: neo4j; extra == "all"
+Requires-Dist: aiomysql; extra == "all"
+Requires-Dist: tcvectordb; extra == "all"
+Requires-Dist: tcvdb_text; extra == "all"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-asyncio; extra == "dev"
+Requires-Dist: httpx; extra == "dev"
+Dynamic: license-file
+
+# HY Memory
+
+Production-grade dual-system cognitive memory for LLM agents.
+
+English | [中文](README.zh.md)
+
+## Quick Start
+
+```bash
+pip install hy-memory-internal
+```
+
+```python
+from hy_memory import HyMemoryClient
+
+client = HyMemoryClient(mode="pro")
+
+# Write — plain text
+client.add("I love sci-fi movies, especially Interstellar", user_id="user_1")
+
+# Write — conversation messages (OpenAI format)
+client.add([
+    {"role": "user", "content": "Recommend a movie"},
+    {"role": "assistant", "content": "Try Interstellar — a sci-fi masterpiece by Nolan"},
+], user_id="user_1")
+
+# Search
+results = client.search("What movies does the user like?", user_ids=["user_1"])
+for mem in results["memories"]["normal"]:
+    print(f"  [{mem['score']:.2f}] {mem['content']}")
+
+client.close()
+```
+
+## Features
+
+- **7-Layer Memory Architecture** — L0 (basic info) through L7 (intentions), progressively abstracted
+- **LLM-Driven Extraction** — Automatically extracts durable memories and forward-looking intentions (with expiry)
+- **Three Processing Modes** — lite (embedding only), pro (+ LLM extraction), ultra (+ graph inference)
+- **Semantic Search** — Vector similarity with profile/normal/proactive channel separation
+- **Evolution Chains** — Tracks how memories update over time via supersedes links
+- **Graph Knowledge** (ultra mode) — Schema inference and cross-domain pattern detection
+- **Multiple Backends** — ChromaDB, Qdrant, FAISS for vectors; Neo4j, Kuzu for graphs
+- **OpenAI-Compatible** — Works with any LLM/embedding service that supports the OpenAI API format
+
+## Configuration
+
+Minimal setup — just two API keys:
+
+```bash
+export MEMORY_LLM_API_KEY="sk-your-key"
+export MEMORY_LLM_BASE_URL="https://api.deepseek.com"
+export MEMORY_LLM_MODEL="deepseek-chat"
+
+export MEMORY_EMBEDDER_API_KEY="sk-your-key"
+export MEMORY_EMBEDDER_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+export MEMORY_EMBEDDER_MODEL="text-embedding-v3"
+export MEMORY_EMBEDDING_DIMS=1024
+```
+
+Or use OpenAI defaults with a single key:
+
+```bash
+export OPENAI_API_KEY="sk-your-key"
+```
+
+## Modes
+
+| Mode | What it does | Graph | Best for |
+|------|-------------|-------|----------|
+| **lite** | Embedding-only write, no LLM | No | Fast ingestion, zero LLM cost |
+| **pro** | + LLM extraction + reconciliation | No | Standard use case |
+| **ultra** | + System 2 schema inference + sweeper | Yes | Full cognitive architecture |
+
+## Install Options
+
+```bash
+pip install hy-memory-internal            # Core (ChromaDB included)
+pip install hy-memory-internal[qdrant]    # + Qdrant
+pip install hy-memory-internal[faiss]     # + FAISS
+pip install hy-memory-internal[graph]     # + Neo4j + Kuzu
+pip install hy-memory-internal[redis]     # + Redis cache
+pip install hy-memory-internal[all]       # Everything
+```
+
+## API Overview
+
+```python
+from hy_memory import HyMemoryClient
+
+client = HyMemoryClient(mode="pro")
+
+# Write memory
+client.add("User likes basketball", user_id="u1")
+client.add([
+    {"role": "user", "content": "Recommend a movie"},
+    {"role": "assistant", "content": "Try Interstellar"},
+], user_id="u1")
+
+# Search (returns profile/normal/proactive channels)
+results = client.search("hobbies", user_ids=["u1"], limit=10)
+
+# CRUD
+client.get("memory_id")
+client.update("memory_id", "Updated content")
+client.delete("memory_id")
+client.list_memories(user_id="u1")
+
+# Ultra mode: check System 2 completion
+status = client.get_write_status("request_id")
+
+client.close()
+```
+
+## Documentation
+
+- [Usage Guide](docs/usage.md) — Full configuration reference, API details, deployment patterns
+- [Environment Variables](.env.example) — All available env vars with defaults
+- [OpenClaw Plugin](plugins/openclaw/README.md) — Agent integration under `plugins/` (see [plugins/README.md](plugins/README.md))
+
+## License
+
+MIT

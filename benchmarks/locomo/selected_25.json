@@ -1,0 +1,45 @@
+{
+  "benchmark": "LoCoMo (ACL 2024)",
+  "source": "https://github.com/snap-research/locomo",
+  "sample_id": "conv-26",
+  "subject": "Caroline",
+  "dataset_sha256": "79FA87E90F04081343B8C8DEBECB80A9A6842B76A7AA537DC9FDF651EA698FF4",
+  "category_names": {
+    "1": "multi_hop",
+    "2": "temporal",
+    "3": "open_domain",
+    "4": "single_hop",
+    "5": "adversarial"
+  },
+  "questions": [
+    {"qa_index": 32, "category": 1, "question": "What LGBTQ+ events has Caroline participated in?", "answer": "Pride parade, school speech, support group", "evidence": ["D5:1", "D8:17", "D3:1", "D1:3"]},
+    {"qa_index": 39, "category": 1, "question": "In what ways is Caroline participating in the LGBTQ community?", "answer": "Joining activist group, going to pride parades, participating in an art show, mentoring program", "evidence": ["D10:3", "D5:1", "D9:12", "D9:2"]},
+    {"qa_index": 47, "category": 1, "question": "Who supports Caroline when she has a negative experience?", "answer": "Her mentors, family, and friends", "evidence": ["D12:1", "D3:11"]},
+    {"qa_index": 56, "category": 1, "question": "What symbols are important to Caroline?", "answer": "Rainbow flag, transgender symbol", "evidence": ["D14:15", "D4:1"]},
+    {"qa_index": 65, "category": 1, "question": "What are some changes Caroline has faced during her transition journey?", "answer": "Changes to her body, losing unsupportive friends", "evidence": ["D16:15", "D11:14"]},
+
+    {"qa_index": 0, "category": 2, "question": "When did Caroline go to the LGBTQ support group?", "answer": "7 May 2023", "evidence": ["D1:3"]},
+    {"qa_index": 28, "category": 2, "question": "When did Caroline go to the adoption meeting?", "answer": "The friday before 15 July 2023", "evidence": ["D8:9"]},
+    {"qa_index": 41, "category": 2, "question": "When did Caroline join a new activist group?", "answer": "The Tuesday before 20 July 2023", "evidence": ["D10:3"]},
+    {"qa_index": 57, "category": 2, "question": "When did Caroline encounter people on a hike and have a negative experience?", "answer": "The week before 25 August 2023", "evidence": ["D14:1"]},
+    {"qa_index": 79, "category": 2, "question": "When did Caroline pass the adoption interview?", "answer": "The Friday before 22 October 2023", "evidence": ["D19:1"]},
+
+    {"qa_index": 2, "category": 3, "question": "What fields would Caroline be likely to pursue in her educaton?", "answer": "Psychology, counseling certification", "evidence": ["D1:9", "D1:11"]},
+    {"qa_index": 14, "category": 3, "question": "Would Caroline still want to pursue counseling as a career if she hadn't received support growing up?", "answer": "Likely no", "evidence": ["D4:15", "D3:5"]},
+    {"qa_index": 50, "category": 3, "question": "What would Caroline's political leaning likely be?", "answer": "Liberal", "evidence": ["D12:1"]},
+    {"qa_index": 59, "category": 3, "question": "Would Caroline be considered religious?", "answer": "Somewhat, but not extremely religious", "evidence": ["D14:19", "D12:1"]},
+    {"qa_index": 81, "category": 3, "question": "Would Caroline want to move back to her home country soon?", "answer": "No; she's in the process of adopting children.", "evidence": ["D19:1", "D19:3"]},
+
+    {"qa_index": 85, "category": 4, "question": "What are Caroline's plans for the summer?", "answer": "researching adoption agencies", "evidence": ["D2:8"]},
+    {"qa_index": 91, "category": 4, "question": "What does Caroline's necklace symbolize?", "answer": "love, faith, and strength", "evidence": ["D4:3"]},
+    {"qa_index": 116, "category": 4, "question": "What inspired Caroline's painting for the art show?", "answer": "visiting an LGBTQ center and wanting to capture unity and strength", "evidence": ["D9:16"]},
+    {"qa_index": 134, "category": 4, "question": "What advice does Caroline give for getting started with adoption?", "answer": "Do research, find an adoption agency or lawyer, gather necessary documents, and prepare emotionally.", "evidence": ["D17:7"]},
+    {"qa_index": 139, "category": 4, "question": "What was the poetry reading that Caroline attended about?", "answer": "It was a transgender poetry reading where transgender people shared their stories.", "evidence": ["D17:18"]},
+
+    {"qa_index": 153, "category": 5, "question": "What are Melanie's plans for the summer with respect to adoption?", "answer": null, "evidence": ["D2:8"]},
+    {"qa_index": 164, "category": 5, "question": "What kind of counseling workshop did Melanie attend recently?", "answer": null, "evidence": ["D4:13"]},
+    {"qa_index": 171, "category": 5, "question": "What did Melanie see at the council meeting for adoption?", "answer": null, "evidence": ["D8:9"]},
+    {"qa_index": 185, "category": 5, "question": "Which classical musicians does Caroline enjoy listening to?", "answer": null, "evidence": ["D15:28"]},
+    {"qa_index": 191, "category": 5, "question": "What happened to Caroline's son on their road trip?", "answer": null, "evidence": ["D18:1"]}
+  ]
+}

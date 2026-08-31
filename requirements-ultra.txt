@@ -1,0 +1,4 @@
+./packages/hy_memory-1.2.21-py3-none-any.whl
+pytest==9.1.1
+pytest-asyncio==1.4.0
+httpx>=0.28,<1

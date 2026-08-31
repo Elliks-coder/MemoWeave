@@ -1,0 +1,21 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+.runtime/
+results/
+packages/
+
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+.coverage
+htmlcov/
+
+.idea/
+.vscode/
+
+# LoCoMo 原始数据不随项目代码重新分发；保留评测脚本、清单与汇总报告。
+benchmarks/locomo/data/

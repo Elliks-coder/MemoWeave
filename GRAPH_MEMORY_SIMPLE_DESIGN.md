@@ -1,6 +1,6 @@
 # Graph 记忆链路：简版设计说明
 
-> 文档状态：方案评审稿，尚未实现。
+> 文档状态：第一版已在 `feat/graphrag-memory` 分支实现，默认以 Shadow 模式运行。
 
 ## 1. 想解决什么问题
 
@@ -180,5 +180,36 @@ L6 仍通过 `DERIVED_FROM` 指向支持它的 `FactRef`，不与实体事实图
 2. **离线核验：**人工抽检关系、实体合并和 provenance。
 3. **A/B 评测：**在开发集调通，再用新的未观察题集做最终比较。
 4. **受控上线：**达成验收标准后，才让图补充事实进入回答上下文。
+
+## 10. 当前实现状态
+
+第一版已经完成以下链路：
+
+- extractor 在功能开关启用时，从 L1 新消息中输出每条 memory 的显式候选关系；
+- writer 使用 reconciler 的 `source_indices` 将候选关系对齐到真正写入的 L2；
+- Kuzu 保存 `Entity / Assertion / EpisodeRef / VdbRef` 及其 provenance 边；
+- `ADD / UPDATE / SUPERSEDE` 成功后才发布关系，并对实际节点和边进行只读核验；
+- Legacy Reader 支持 query 实体与向量 L2 双种子、最多两跳扩展、L2 原文回查；
+- 默认 Shadow 模式只记录候选路径，不改变现有答案；关闭 Shadow 后才参与融合；
+- 用户、agent、session 和单条事实删除会同步清理关系及孤立引用；
+- `READ_GRAPH_RAG` trace 记录锚点、候选事实、最终补充事实和完整路径。
+
+启用 Shadow：
+
+```env
+MEMORY_GRAPHRAG_ENABLED=true
+MEMORY_GRAPHRAG_SHADOW_MODE=true
+```
+
+让图证据进入回答上下文：
+
+```env
+MEMORY_GRAPHRAG_ENABLED=true
+MEMORY_GRAPHRAG_SHADOW_MODE=false
+```
+
+关系候选是在新对话写入时生成的。旧 runtime 中已经存在的 L2 没有对应候选关系，
+不会被自动猜测回填；正式 A/B 评测应使用新的 runtime 重新写入同一批对话，避免
+新旧索引混合造成不公平比较。
 
 一句话总结：**L1 保证不漏，L2 保证不乱，Graph 负责把跨对话事实连起来，最终答案仍由可追溯证据负责。**

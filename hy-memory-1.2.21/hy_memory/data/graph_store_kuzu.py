@@ -20,6 +20,8 @@ import concurrent.futures
 import functools
 import logging
 import json
+import uuid
+import re
 
 from ..models.memory import MemoryNode, MemoryLayer, MemoryStatus
 from ..config import MemoryConfig
@@ -119,9 +121,79 @@ CREATE NODE TABLE VdbRef(
     layer STRING,
     PRIMARY KEY (node_id)
 )""",
+    # Entity-Fact GraphRAG nodes.  Assertion is reified instead of using a
+    # plain relationship so provenance, validity and version state remain
+    # first-class queryable fields.
+    "Entity": """
+CREATE NODE TABLE Entity(
+    entity_id STRING,
+    isolation_key STRING,
+    user_id STRING,
+    agent_id STRING,
+    canonical_name STRING,
+    normalized_name STRING,
+    entity_type STRING,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    PRIMARY KEY (entity_id)
+)""",
+    "Assertion": """
+CREATE NODE TABLE Assertion(
+    assertion_id STRING,
+    isolation_key STRING,
+    user_id STRING,
+    agent_id STRING,
+    predicate STRING,
+    status STRING,
+    confidence DOUBLE,
+    evidence_type STRING,
+    source_fact_id STRING,
+    source_turn_ids STRING,
+    observed_at TIMESTAMP,
+    valid_from TIMESTAMP,
+    valid_until TIMESTAMP,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    PRIMARY KEY (assertion_id)
+)""",
+    "EpisodeRef": """
+CREATE NODE TABLE EpisodeRef(
+    episode_id STRING,
+    isolation_key STRING,
+    session_id STRING,
+    turn_id STRING,
+    turn_index INT64,
+    observed_at TIMESTAMP,
+    PRIMARY KEY (episode_id)
+)""",
     "DERIVED_FROM": """
 CREATE REL TABLE DERIVED_FROM(
     FROM Memory TO VdbRef,
+    created_at TIMESTAMP
+)""",
+    "ASSERTION_SUBJECT": """
+CREATE REL TABLE ASSERTION_SUBJECT(
+    FROM Assertion TO Entity,
+    created_at TIMESTAMP
+)""",
+    "ASSERTION_OBJECT": """
+CREATE REL TABLE ASSERTION_OBJECT(
+    FROM Assertion TO Entity,
+    created_at TIMESTAMP
+)""",
+    "ASSERTION_SUPPORTED_BY": """
+CREATE REL TABLE ASSERTION_SUPPORTED_BY(
+    FROM Assertion TO VdbRef,
+    created_at TIMESTAMP
+)""",
+    "VDBREF_FROM_EPISODE": """
+CREATE REL TABLE VDBREF_FROM_EPISODE(
+    FROM VdbRef TO EpisodeRef,
+    created_at TIMESTAMP
+)""",
+    "ASSERTION_SUPERSEDES": """
+CREATE REL TABLE ASSERTION_SUPERSEDES(
+    FROM Assertion TO Assertion,
     created_at TIMESTAMP
 )""",
     # Cross-domain schema induction: L6 basic → L6 core (单向)
@@ -190,6 +262,7 @@ class KuzuGraphStore(GraphStoreBase):
         self._db = None
         self._conn = None
         self._available = False  # 是否成功初始化
+        self._graphrag_available = False
 
         # embedding 维度（从 VectorStore 或 Embedder 配置中取）
         vs_dims = getattr(getattr(config, 'vector_store', None), 'embedding_dims', None)
@@ -317,6 +390,30 @@ class KuzuGraphStore(GraphStoreBase):
             self._conn = None
             self._available = False
             return
+
+        graphrag_tables = [
+            "VdbRef", "Entity", "Assertion", "EpisodeRef",
+            "ASSERTION_SUBJECT", "ASSERTION_OBJECT",
+            "ASSERTION_SUPPORTED_BY", "VDBREF_FROM_EPISODE",
+            "ASSERTION_SUPERSEDES",
+        ]
+        graph_config = getattr(self.config, "graph_store", None)
+        if getattr(graph_config, "graphrag_enabled", False):
+            missing_graphrag = [
+                table for table in graphrag_tables if not self._table_exists(table)
+            ]
+            self._graphrag_available = not missing_graphrag
+            if missing_graphrag:
+                logger.error(
+                    "Entity-Fact GraphRAG schema incomplete; shadow/publish disabled: %s",
+                    missing_graphrag,
+                )
+        else:
+            # Schema is still created so enabling the feature later is a config-only
+            # change; methods remain gated by graphrag_enabled.
+            self._graphrag_available = all(
+                self._table_exists(table) for table in graphrag_tables
+            )
 
         # 创建 HNSW 向量索引（已有则跳过）
         self._ensure_vector_indexes(dims)
@@ -700,14 +797,25 @@ class KuzuGraphStore(GraphStoreBase):
             return False
 
     async def delete_node(self, node_id: str) -> bool:
-        """删除 Memory 节点及其关联边"""
+        """删除 Memory 节点；若 ID 同时是 L2 FactRef，也清理其 assertions。"""
         if not self._available:
             return False
         try:
+            if self._graphrag_available:
+                await self._run(
+                    """
+                    MATCH (a:Assertion)-[:ASSERTION_SUPPORTED_BY]->
+                          (f:VdbRef {node_id: $nid})
+                    DETACH DELETE a;
+                    """,
+                    {"nid": node_id},
+                )
             await self._run(
                 "MATCH (m:Memory {node_id: $nid}) DETACH DELETE m;",
                 {"nid": node_id},
             )
+            if self._graphrag_available:
+                await self._cleanup_graphrag_orphans()
             return await self.get_node(node_id) is None
         except Exception as e:
             logger.warning(f"delete_node failed for {node_id}: {e}")
@@ -798,23 +906,135 @@ class KuzuGraphStore(GraphStoreBase):
                 topic_params,
             )
 
-            # 孤立 VdbRef（DERIVED_FROM 已随 Memory 删除）
-            await self._run(
-                "MATCH (v:VdbRef) "
-                "OPTIONAL MATCH ()-[r:DERIVED_FROM]->(v) "
-                "WITH v, count(r) AS cnt WHERE cnt = 0 "
-                "DETACH DELETE v;",
-                {},
-            )
+            # Entity-Fact GraphRAG 使用 user::agent 作为跨 session tenant。
+            # session 粒度删除时，经 EpisodeRef 找到对应 FactRef/assertions；
+            # 更大粒度则直接按 assertion/entity 的 user/agent 字段删除。
+            assertion_count = 0
+            if self._graphrag_available:
+                if session_id is not None:
+                    tenant_key = f"{user_id}::{agent_id or 'default_agent'}"
+                    assertion_rows = await self._run(
+                        """
+                        MATCH (a:Assertion)-[:ASSERTION_SUPPORTED_BY]->(v:VdbRef)
+                              -[:VDBREF_FROM_EPISODE]->(e:EpisodeRef)
+                        WHERE e.isolation_key = $ik AND e.session_id = $sid
+                        RETURN count(DISTINCT a);
+                        """,
+                        {"ik": tenant_key, "sid": session_id},
+                    )
+                    assertion_count = assertion_rows[0][0] if assertion_rows else 0
+                    await self._run(
+                        """
+                        MATCH (a:Assertion)-[:ASSERTION_SUPPORTED_BY]->(v:VdbRef)
+                              -[:VDBREF_FROM_EPISODE]->(e:EpisodeRef)
+                        WHERE e.isolation_key = $ik AND e.session_id = $sid
+                        WITH DISTINCT a DETACH DELETE a;
+                        """,
+                        {"ik": tenant_key, "sid": session_id},
+                    )
+                    await self._run(
+                        """
+                        MATCH (e:EpisodeRef)
+                        WHERE e.isolation_key = $ik AND e.session_id = $sid
+                        DETACH DELETE e;
+                        """,
+                        {"ik": tenant_key, "sid": session_id},
+                    )
+                else:
+                    assertion_conds = ["a.user_id = $uid"]
+                    assertion_params: Dict[str, Any] = {"uid": user_id}
+                    entity_conds = ["e.user_id = $uid"]
+                    entity_params: Dict[str, Any] = {"uid": user_id}
+                    episode_conds = ["e.isolation_key STARTS WITH $pfx"]
+                    episode_params: Dict[str, Any] = {"pfx": f"{user_id}::"}
+                    if agent_id is not None:
+                        assertion_conds.append("a.agent_id = $aid")
+                        assertion_params["aid"] = agent_id
+                        entity_conds.append("e.agent_id = $aid")
+                        entity_params["aid"] = agent_id
+                        episode_conds = ["e.isolation_key = $ik"]
+                        episode_params = {"ik": f"{user_id}::{agent_id}"}
+                    assertion_where = " AND ".join(assertion_conds)
+                    count = await self._run(
+                        f"MATCH (a:Assertion) WHERE {assertion_where} RETURN count(a);",
+                        assertion_params,
+                    )
+                    assertion_count = count[0][0] if count else 0
+                    await self._run(
+                        f"MATCH (a:Assertion) WHERE {assertion_where} DETACH DELETE a;",
+                        assertion_params,
+                    )
+                    await self._run(
+                        f"MATCH (e:Entity) WHERE {' AND '.join(entity_conds)} "
+                        "DETACH DELETE e;",
+                        entity_params,
+                    )
+                    await self._run(
+                        f"MATCH (e:EpisodeRef) WHERE {' AND '.join(episode_conds)} "
+                        "DETACH DELETE e;",
+                        episode_params,
+                    )
+
+                await self._cleanup_graphrag_orphans()
 
             logger.info(
                 f"[graph-store] delete_by_metadata user={user_id} agent={agent_id} "
-                f"session={session_id} memory_nodes={mem_count}"
+                f"session={session_id} memory_nodes={mem_count} "
+                f"assertions={assertion_count}"
             )
             return total
         except Exception as e:
             logger.warning(f"delete_by_metadata failed (user_id={user_id}): {e}")
             return 0
+
+    async def _cleanup_graphrag_orphans(self) -> None:
+        """清理没有 assertion 的 Entity/EpisodeRef 与无人引用的 VdbRef。"""
+        if not self._graphrag_available:
+            return
+        await self._run(
+            """
+            MATCH (e:Entity)
+            OPTIONAL MATCH (:Assertion)-[s:ASSERTION_SUBJECT]->(e)
+            OPTIONAL MATCH (:Assertion)-[o:ASSERTION_OBJECT]->(e)
+            WITH e, count(s) + count(o) AS refs
+            WHERE refs = 0 DETACH DELETE e;
+            """
+        )
+        await self._run(
+            """
+            MATCH (e:EpisodeRef)
+            OPTIONAL MATCH (:VdbRef)-[r:VDBREF_FROM_EPISODE]->(e)
+            WITH e, count(r) AS refs
+            WHERE refs = 0 DETACH DELETE e;
+            """
+        )
+
+        # Kuzu 版本兼容性比复杂的多 OPTIONAL MATCH 更可靠；purge 是低频操作，
+        # 逐个核验 VdbRef 的三类引用可接受，并避免误删其他用户的事实引用。
+        rows = await self._run("MATCH (v:VdbRef) RETURN v.node_id;")
+        for row in rows or []:
+            node_id = row[0]
+            refs = 0
+            for edge_label in (
+                "DERIVED_FROM", "ASSERTION_SUPPORTED_BY", "VDBREF_FROM_EPISODE",
+            ):
+                if edge_label == "VDBREF_FROM_EPISODE":
+                    query = (
+                        "MATCH (v:VdbRef {node_id: $nid})"
+                        "-[r:VDBREF_FROM_EPISODE]->() RETURN count(r);"
+                    )
+                else:
+                    query = (
+                        f"MATCH ()-[r:{edge_label}]->"
+                        "(v:VdbRef {node_id: $nid}) RETURN count(r);"
+                    )
+                count_rows = await self._run(query, {"nid": node_id})
+                refs += int(count_rows[0][0]) if count_rows else 0
+            if refs == 0:
+                await self._run(
+                    "MATCH (v:VdbRef {node_id: $nid}) DETACH DELETE v;",
+                    {"nid": node_id},
+                )
 
     # ================================================================
     # 边操作
@@ -1092,6 +1312,790 @@ class KuzuGraphStore(GraphStoreBase):
         except Exception as e:
             logger.debug(f"get_evidence_vdbrefs for {memory_node_id}: {e}")
             return []
+
+    # ================================================================
+    # Entity-Fact GraphRAG
+    # ================================================================
+
+    @staticmethod
+    def _stable_graph_id(prefix: str, value: str) -> str:
+        return f"{prefix}_{uuid.uuid5(uuid.NAMESPACE_URL, value).hex}"
+
+    async def _ensure_graphrag_edge(
+        self,
+        *,
+        source_label: str,
+        source_key: str,
+        source_id: str,
+        edge_label: str,
+        target_label: str,
+        target_key: str,
+        target_id: str,
+    ) -> bool:
+        """幂等创建一条内部已知类型的边，并用只读查询核验。"""
+        allowed = {
+            ("Assertion", "assertion_id", "ASSERTION_SUBJECT", "Entity", "entity_id"),
+            ("Assertion", "assertion_id", "ASSERTION_OBJECT", "Entity", "entity_id"),
+            ("Assertion", "assertion_id", "ASSERTION_SUPPORTED_BY", "VdbRef", "node_id"),
+            ("VdbRef", "node_id", "VDBREF_FROM_EPISODE", "EpisodeRef", "episode_id"),
+            ("Assertion", "assertion_id", "ASSERTION_SUPERSEDES", "Assertion", "assertion_id"),
+        }
+        signature = (
+            source_label, source_key, edge_label, target_label, target_key,
+        )
+        if signature not in allowed or not source_id or not target_id:
+            return False
+
+        match_params = {"src": source_id, "dst": target_id}
+        create_params = {**match_params, "now": datetime.now()}
+        count_query = f"""
+            MATCH (s:{source_label} {{{source_key}: $src}})
+                  -[r:{edge_label}]->
+                  (t:{target_label} {{{target_key}: $dst}})
+            RETURN count(r);
+        """
+        rows = await self._run(count_query, match_params)
+        if rows and int(rows[0][0]) > 0:
+            return True
+        created = await self._run(
+            f"""
+            MATCH (s:{source_label} {{{source_key}: $src}}),
+                  (t:{target_label} {{{target_key}: $dst}})
+            CREATE (s)-[:{edge_label} {{created_at: $now}}]->(t)
+            RETURN s.{source_key}, t.{target_key};
+            """,
+            create_params,
+        )
+        if not created:
+            return False
+        verified = await self._run(count_query, match_params)
+        return bool(verified and int(verified[0][0]) > 0)
+
+    async def _ensure_entity(
+        self,
+        *,
+        tenant_key: str,
+        user_id: str,
+        agent_id: str,
+        name: str,
+        normalized_name: str,
+        entity_type: str,
+    ) -> str:
+        entity_id = self._stable_graph_id(
+            "entity", f"{tenant_key}:{entity_type}:{normalized_name}"
+        )
+        now = datetime.now()
+        rows = await self._run(
+            "MATCH (e:Entity {entity_id: $eid}) RETURN e.entity_id;",
+            {"eid": entity_id},
+        )
+        params = {
+            "eid": entity_id,
+            "ik": tenant_key,
+            "uid": user_id,
+            "aid": agent_id,
+            "name": name,
+            "norm": normalized_name,
+            "etype": entity_type,
+            "now": now,
+        }
+        if rows:
+            await self._run(
+                """
+                MATCH (e:Entity {entity_id: $eid})
+                SET e.canonical_name = $name, e.updated_at = $now;
+                """,
+                {"eid": entity_id, "name": name, "now": now},
+            )
+        else:
+            await self._run(
+                """
+                CREATE (e:Entity {
+                    entity_id: $eid, isolation_key: $ik, user_id: $uid,
+                    agent_id: $aid, canonical_name: $name,
+                    normalized_name: $norm, entity_type: $etype,
+                    created_at: $now, updated_at: $now
+                });
+                """,
+                params,
+            )
+        verified = await self._run(
+            "MATCH (e:Entity {entity_id: $eid}) RETURN e.entity_id;",
+            {"eid": entity_id},
+        )
+        return entity_id if verified else ""
+
+    async def _ensure_episode(
+        self,
+        *,
+        tenant_key: str,
+        session_id: str,
+        turn_id: str,
+        observed_at: Optional[datetime],
+    ) -> str:
+        episode_id = self._stable_graph_id(
+            "episode", f"{tenant_key}:{turn_id}"
+        )
+        rows = await self._run(
+            "MATCH (e:EpisodeRef {episode_id: $eid}) RETURN e.episode_id;",
+            {"eid": episode_id},
+        )
+        if not rows:
+            match = re.search(r":turn:(\d+)$", turn_id or "")
+            turn_index = int(match.group(1)) if match else None
+            await self._run(
+                """
+                CREATE (e:EpisodeRef {
+                    episode_id: $eid, isolation_key: $ik,
+                    session_id: $sid, turn_id: $tid, turn_index: $tidx,
+                    observed_at: $observed
+                });
+                """,
+                {
+                    "eid": episode_id,
+                    "ik": tenant_key,
+                    "sid": session_id or "default_session",
+                    "tid": turn_id,
+                    "tidx": turn_index,
+                    "observed": observed_at,
+                },
+            )
+        verified = await self._run(
+            "MATCH (e:EpisodeRef {episode_id: $eid}) RETURN e.episode_id;",
+            {"eid": episode_id},
+        )
+        return episode_id if verified else ""
+
+    async def _set_assertion_superseded(
+        self,
+        assertion_id: str,
+        valid_until: Optional[datetime],
+    ) -> bool:
+        rows = await self._run(
+            """
+            MATCH (a:Assertion {assertion_id: $aid})
+            SET a.status = 'superseded', a.valid_until = $until,
+                a.updated_at = $now
+            RETURN a.assertion_id;
+            """,
+            {"aid": assertion_id, "until": valid_until, "now": datetime.now()},
+        )
+        return bool(rows)
+
+    async def _assertions_for_fact(self, fact_id: str) -> List[Dict[str, Any]]:
+        rows = await self._run(
+            """
+            MATCH (a:Assertion)-[:ASSERTION_SUBJECT]->(s:Entity)
+            MATCH (a)-[:ASSERTION_SUPPORTED_BY]->(f:VdbRef {node_id: $fid})
+            RETURN a.assertion_id, a.predicate, s.normalized_name,
+                   a.valid_until, a.status;
+            """,
+            {"fid": fact_id},
+        )
+        return [
+            {
+                "assertion_id": row[0],
+                "predicate": row[1],
+                "subject_normalized": row[2],
+                "valid_until": row[3],
+                "status": row[4],
+            }
+            for row in (rows or [])
+        ]
+
+    async def publish_fact_relations(
+        self,
+        fact_node: MemoryNode,
+        relations: List[Dict[str, Any]],
+        supersedes_fact_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """发布 L2 事实关系，幂等写入并逐条验证 assertion 的三条证据边。"""
+        graph_config = getattr(self.config, "graph_store", None)
+        enabled = bool(getattr(graph_config, "graphrag_enabled", False))
+        if not enabled:
+            return {
+                "available": self._graphrag_available,
+                "enabled": False,
+                "success": True,
+                "published": 0,
+                "rejected": 0,
+                "errors": [],
+            }
+        if not self._available or not self._graphrag_available:
+            return {
+                "available": False,
+                "enabled": True,
+                "success": False,
+                "published": 0,
+                "rejected": len(relations or []),
+                "errors": ["Entity-Fact GraphRAG schema is unavailable"],
+            }
+        if fact_node.layer != MemoryLayer.L2_FACT:
+            return {
+                "available": True,
+                "enabled": True,
+                "success": False,
+                "published": 0,
+                "rejected": len(relations or []),
+                "errors": ["only L2 facts may publish active assertions"],
+            }
+
+        agent_id = fact_node.agent_id or "default_agent"
+        tenant_key = f"{fact_node.user_id}::{agent_id}"
+        errors: List[str] = []
+        published_records: List[Dict[str, Any]] = []
+        desired_ids = set()
+
+        try:
+            await self.ensure_vdbref(fact_node.node_id, fact_node.layer.value)
+            fact_ref = await self._run(
+                "MATCH (f:VdbRef {node_id: $fid}) RETURN f.node_id;",
+                {"fid": fact_node.node_id},
+            )
+            if not fact_ref:
+                raise RuntimeError("FactRef postcondition failed")
+
+            for relation in relations or []:
+                try:
+                    subject_id = await self._ensure_entity(
+                        tenant_key=tenant_key,
+                        user_id=fact_node.user_id,
+                        agent_id=agent_id,
+                        name=str(relation["subject"]),
+                        normalized_name=str(relation["subject_normalized"]),
+                        entity_type=str(relation.get("subject_type") or "other"),
+                    )
+                    object_id = await self._ensure_entity(
+                        tenant_key=tenant_key,
+                        user_id=fact_node.user_id,
+                        agent_id=agent_id,
+                        name=str(relation["object"]),
+                        normalized_name=str(relation["object_normalized"]),
+                        entity_type=str(relation.get("object_type") or "other"),
+                    )
+                    if not subject_id or not object_id:
+                        raise RuntimeError("entity postcondition failed")
+
+                    predicate = str(relation["predicate"])
+                    assertion_id = self._stable_graph_id(
+                        "assertion",
+                        f"{fact_node.node_id}:{subject_id}:{predicate}:{object_id}",
+                    )
+                    desired_ids.add(assertion_id)
+                    turn_ids = list(dict.fromkeys(
+                        str(value) for value in (
+                            relation.get("source_turn_ids")
+                            or fact_node.evidence_chain
+                            or []
+                        ) if str(value)
+                    ))
+                    now = datetime.now()
+                    params = {
+                        "asid": assertion_id,
+                        "ik": tenant_key,
+                        "uid": fact_node.user_id,
+                        "agent": agent_id,
+                        "pred": predicate,
+                        "confidence": float(relation.get("confidence", 0.0)),
+                        "etype": str(relation.get("evidence_type") or "explicit"),
+                        "fid": fact_node.node_id,
+                        "turns": json.dumps(turn_ids, ensure_ascii=False),
+                        "observed": fact_node.observed_at or fact_node.memory_at,
+                        "valid_from": fact_node.valid_from,
+                        "valid_until": fact_node.valid_until,
+                        "now": now,
+                    }
+                    existing = await self._run(
+                        "MATCH (a:Assertion {assertion_id: $asid}) RETURN a.assertion_id;",
+                        {"asid": assertion_id},
+                    )
+                    if existing:
+                        written = await self._run(
+                            """
+                            MATCH (a:Assertion {assertion_id: $asid})
+                            SET a.status = 'active', a.confidence = $confidence,
+                                a.evidence_type = $etype,
+                                a.source_turn_ids = $turns,
+                                a.observed_at = $observed,
+                                a.valid_from = $valid_from,
+                                a.valid_until = $valid_until,
+                                a.updated_at = $now
+                            RETURN a.assertion_id;
+                            """,
+                            {
+                                "asid": assertion_id,
+                                "confidence": params["confidence"],
+                                "etype": params["etype"],
+                                "turns": params["turns"],
+                                "observed": params["observed"],
+                                "valid_from": params["valid_from"],
+                                "valid_until": params["valid_until"],
+                                "now": now,
+                            },
+                        )
+                    else:
+                        written = await self._run(
+                            """
+                            CREATE (a:Assertion {
+                                assertion_id: $asid, isolation_key: $ik,
+                                user_id: $uid, agent_id: $agent,
+                                predicate: $pred, status: 'active',
+                                confidence: $confidence, evidence_type: $etype,
+                                source_fact_id: $fid, source_turn_ids: $turns,
+                                observed_at: $observed, valid_from: $valid_from,
+                                valid_until: $valid_until,
+                                created_at: $now, updated_at: $now
+                            })
+                            RETURN a.assertion_id;
+                            """,
+                            params,
+                        )
+                    if not written:
+                        raise RuntimeError("assertion write returned zero rows")
+
+                    edge_specs = [
+                        ("ASSERTION_SUBJECT", "Entity", "entity_id", subject_id),
+                        ("ASSERTION_OBJECT", "Entity", "entity_id", object_id),
+                        ("ASSERTION_SUPPORTED_BY", "VdbRef", "node_id", fact_node.node_id),
+                    ]
+                    for edge_label, target_label, target_key, target_id in edge_specs:
+                        ok = await self._ensure_graphrag_edge(
+                            source_label="Assertion",
+                            source_key="assertion_id",
+                            source_id=assertion_id,
+                            edge_label=edge_label,
+                            target_label=target_label,
+                            target_key=target_key,
+                            target_id=target_id,
+                        )
+                        if not ok:
+                            raise RuntimeError(f"{edge_label} postcondition failed")
+
+                    for turn_id in turn_ids:
+                        episode_id = await self._ensure_episode(
+                            tenant_key=tenant_key,
+                            session_id=fact_node.source_session_id or fact_node.session_id,
+                            turn_id=turn_id,
+                            observed_at=fact_node.observed_at or fact_node.memory_at,
+                        )
+                        if not episode_id:
+                            raise RuntimeError("EpisodeRef postcondition failed")
+                        ok = await self._ensure_graphrag_edge(
+                            source_label="VdbRef",
+                            source_key="node_id",
+                            source_id=fact_node.node_id,
+                            edge_label="VDBREF_FROM_EPISODE",
+                            target_label="EpisodeRef",
+                            target_key="episode_id",
+                            target_id=episode_id,
+                        )
+                        if not ok:
+                            raise RuntimeError("VDBREF_FROM_EPISODE postcondition failed")
+
+                    published_records.append({
+                        "assertion_id": assertion_id,
+                        "predicate": predicate,
+                        "subject_normalized": relation["subject_normalized"],
+                    })
+                except Exception as relation_error:
+                    errors.append(
+                        f"{relation.get('subject', '?')} "
+                        f"{relation.get('predicate', '?')} "
+                        f"{relation.get('object', '?')}: {relation_error}"
+                    )
+
+            # UPDATE(in-place)：只有本轮确实给出关系时才替换旧集合。抽取器漏掉
+            # relations 不能把已验证的关系静默清空。
+            if relations:
+                for old in await self._assertions_for_fact(fact_node.node_id):
+                    if old["assertion_id"] not in desired_ids and old["status"] == "active":
+                        if not await self._set_assertion_superseded(
+                            old["assertion_id"],
+                            fact_node.observed_at or fact_node.memory_at or datetime.now(),
+                        ):
+                            errors.append(
+                                f"failed to supersede stale assertion {old['assertion_id']}"
+                            )
+
+            # SUPERSEDE：旧事实的 assertions 保留历史有效期，并将语义相同的
+            # subject+predicate 新旧声明连成版本链。
+            transition_at = (
+                fact_node.valid_from
+                or fact_node.event_start
+                or fact_node.observed_at
+                or fact_node.memory_at
+                or datetime.now()
+            )
+            for old_fact_id in supersedes_fact_ids or []:
+                old_assertions = await self._assertions_for_fact(old_fact_id)
+                for old in old_assertions:
+                    old_until = old.get("valid_until")
+                    if old_until is None or old_until > transition_at:
+                        old_until = transition_at
+                    if not await self._set_assertion_superseded(
+                        old["assertion_id"], old_until,
+                    ):
+                        errors.append(
+                            f"failed to supersede old assertion {old['assertion_id']}"
+                        )
+                        continue
+                    for new in published_records:
+                        if (
+                            new["predicate"] == old["predicate"]
+                            and new["subject_normalized"] == old["subject_normalized"]
+                        ):
+                            ok = await self._ensure_graphrag_edge(
+                                source_label="Assertion",
+                                source_key="assertion_id",
+                                source_id=new["assertion_id"],
+                                edge_label="ASSERTION_SUPERSEDES",
+                                target_label="Assertion",
+                                target_key="assertion_id",
+                                target_id=old["assertion_id"],
+                            )
+                            if not ok:
+                                errors.append(
+                                    "ASSERTION_SUPERSEDES postcondition failed: "
+                                    f"{new['assertion_id']} -> {old['assertion_id']}"
+                                )
+
+        except Exception as error:
+            errors.append(str(error))
+
+        summary = {
+            "available": True,
+            "enabled": True,
+            "success": not errors,
+            "published": len(published_records),
+            "rejected": max(0, len(relations or []) - len(published_records)),
+            "errors": errors,
+        }
+        if errors:
+            logger.warning("[graphrag-write] %s", json.dumps(summary, ensure_ascii=False))
+        else:
+            logger.info(
+                "[graphrag-write] fact=%s published=%d supersedes=%d",
+                fact_node.node_id,
+                len(published_records),
+                len(supersedes_fact_ids or []),
+            )
+        return summary
+
+    @staticmethod
+    def _datetime_epoch(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.timestamp()
+        try:
+            return datetime.fromisoformat(str(value)).timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _assertion_visible(cls, row: Dict[str, Any], as_of: Optional[datetime]) -> bool:
+        status = str(row.get("status") or "")
+        if as_of is None:
+            return status == "active"
+        if status not in {"active", "superseded"}:
+            return False
+        point = as_of.timestamp()
+        valid_from = cls._datetime_epoch(row.get("valid_from"))
+        valid_until = cls._datetime_epoch(row.get("valid_until"))
+        return (
+            (valid_from is None or valid_from <= point)
+            and (valid_until is None or point <= valid_until)
+        )
+
+    async def _relations_touching_entity(
+        self,
+        entity_id: str,
+        *,
+        tenant_keys: List[str],
+        user_ids: List[str],
+        as_of: Optional[datetime],
+        max_degree: int,
+    ) -> List[Dict[str, Any]]:
+        rows = await self._run(
+            f"""
+            MATCH (a:Assertion)-[:ASSERTION_SUBJECT]->(s:Entity)
+            MATCH (a)-[:ASSERTION_OBJECT]->(o:Entity)
+            MATCH (a)-[:ASSERTION_SUPPORTED_BY]->(f:VdbRef)
+            WHERE s.entity_id = $eid OR o.entity_id = $eid
+            RETURN a.assertion_id, a.isolation_key, a.user_id,
+                   a.predicate, a.status, a.confidence,
+                   a.valid_from, a.valid_until,
+                   s.entity_id, s.canonical_name, s.normalized_name,
+                   o.entity_id, o.canonical_name, o.normalized_name,
+                   f.node_id
+            LIMIT {int(max_degree)};
+            """,
+            {"eid": entity_id},
+        )
+        result: List[Dict[str, Any]] = []
+        allowed_tenants = set(tenant_keys or [])
+        allowed_users = set(user_ids or [])
+        for row in rows or []:
+            item = {
+                "assertion_id": row[0],
+                "tenant_key": row[1],
+                "user_id": row[2],
+                "predicate": row[3],
+                "status": row[4],
+                "confidence": float(row[5] or 0.0),
+                "valid_from": row[6],
+                "valid_until": row[7],
+                "subject_id": row[8],
+                "subject": row[9],
+                "subject_normalized": row[10],
+                "object_id": row[11],
+                "object": row[12],
+                "object_normalized": row[13],
+                "fact_id": row[14],
+            }
+            if allowed_tenants and item["tenant_key"] not in allowed_tenants:
+                continue
+            if not allowed_tenants and allowed_users and item["user_id"] not in allowed_users:
+                continue
+            if self._assertion_visible(item, as_of):
+                result.append(item)
+        return result
+
+    async def _seed_entities_for_facts(
+        self,
+        fact_ids: List[str],
+        *,
+        tenant_keys: List[str],
+        user_ids: List[str],
+        as_of: Optional[datetime],
+    ) -> List[Dict[str, Any]]:
+        seeds: List[Dict[str, Any]] = []
+        for fact_id in fact_ids:
+            rows = await self._run(
+                """
+                MATCH (a:Assertion)-[:ASSERTION_SUBJECT]->(s:Entity)
+                MATCH (a)-[:ASSERTION_OBJECT]->(o:Entity)
+                MATCH (a)-[:ASSERTION_SUPPORTED_BY]->(f:VdbRef {node_id: $fid})
+                RETURN a.isolation_key, a.user_id, a.status,
+                       a.valid_from, a.valid_until,
+                       s.entity_id, s.canonical_name, s.normalized_name,
+                       o.entity_id, o.canonical_name, o.normalized_name;
+                """,
+                {"fid": fact_id},
+            )
+            for row in rows or []:
+                visibility = {
+                    "status": row[2], "valid_from": row[3], "valid_until": row[4]
+                }
+                if tenant_keys and row[0] not in set(tenant_keys):
+                    continue
+                if not tenant_keys and user_ids and row[1] not in set(user_ids):
+                    continue
+                if not self._assertion_visible(visibility, as_of):
+                    continue
+                for entity_id, name, normalized in (
+                    (row[5], row[6], row[7]), (row[8], row[9], row[10]),
+                ):
+                    if normalized not in {"__user__", "__agent__"}:
+                        seeds.append({
+                            "entity_id": entity_id,
+                            "name": name,
+                            "normalized_name": normalized,
+                            "anchor_fact_id": fact_id,
+                            "origin": "vector_fact",
+                        })
+        return seeds
+
+    async def _seed_entities_for_query(
+        self,
+        query: str,
+        *,
+        tenant_keys: List[str],
+        user_ids: List[str],
+    ) -> List[Dict[str, Any]]:
+        from ..models.graph_memory import normalize_entity_name
+
+        normalized_query = normalize_entity_name(query)
+        if not normalized_query:
+            return []
+        rows = await self._run(
+            """
+            MATCH (e:Entity)
+            RETURN e.entity_id, e.isolation_key, e.user_id,
+                   e.canonical_name, e.normalized_name;
+            """
+        )
+        allowed_tenants = set(tenant_keys or [])
+        allowed_users = set(user_ids or [])
+        seeds: List[Dict[str, Any]] = []
+        for row in rows or []:
+            entity_norm = str(row[4] or "")
+            if entity_norm in {"__user__", "__agent__"} or len(entity_norm) < 2:
+                continue
+            if allowed_tenants and row[1] not in allowed_tenants:
+                continue
+            if not allowed_tenants and allowed_users and row[2] not in allowed_users:
+                continue
+            if entity_norm in normalized_query:
+                seeds.append({
+                    "entity_id": row[0],
+                    "name": row[3],
+                    "normalized_name": entity_norm,
+                    "anchor_fact_id": "",
+                    "origin": "query_entity",
+                })
+        return seeds
+
+    async def expand_fact_relations(
+        self,
+        *,
+        anchor_fact_ids: List[str],
+        query: str,
+        tenant_keys: Optional[List[str]] = None,
+        user_ids: Optional[List[str]] = None,
+        as_of: Optional[Any] = None,
+        max_hops: int = 2,
+        max_facts: int = 5,
+        max_degree: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """从向量命中事实和 query 明确实体出发，做最多两跳的证据扩展。"""
+        graph_config = getattr(self.config, "graph_store", None)
+        if (
+            not getattr(graph_config, "graphrag_enabled", False)
+            or not self._available
+            or not self._graphrag_available
+        ):
+            return []
+
+        tenant_keys = list(dict.fromkeys(tenant_keys or []))
+        user_ids = list(dict.fromkeys(user_ids or []))
+        # GraphRAG contains cross-session facts, so an omitted tenant/user scope
+        # must never mean "search every tenant".  Keep this boundary fail-closed
+        # even though the current reader always supplies user_ids.
+        if not tenant_keys and not user_ids:
+            logger.warning(
+                "[graphrag-read] refused expansion without tenant/user scope"
+            )
+            return []
+        anchor_fact_ids = list(dict.fromkeys(
+            str(value) for value in anchor_fact_ids or [] if str(value)
+        ))
+        max_hops = max(1, min(2, int(max_hops or 2)))
+        max_facts = max(1, int(max_facts or 5))
+        max_degree = max(1, int(max_degree or 25))
+
+        fact_seeds = await self._seed_entities_for_facts(
+            anchor_fact_ids,
+            tenant_keys=tenant_keys,
+            user_ids=user_ids,
+            as_of=as_of,
+        )
+        query_seeds = await self._seed_entities_for_query(
+            query,
+            tenant_keys=tenant_keys,
+            user_ids=user_ids,
+        )
+        seeds = fact_seeds + query_seeds
+        if not seeds:
+            return []
+
+        entity_state: Dict[str, Dict[str, Any]] = {}
+        frontier: List[str] = []
+        for seed in seeds:
+            entity_id = seed["entity_id"]
+            if entity_id not in entity_state:
+                entity_state[entity_id] = {
+                    "path": [],
+                    "confidence": 1.0,
+                    "anchor_fact_id": seed.get("anchor_fact_id", ""),
+                    "origin": seed.get("origin", ""),
+                }
+                frontier.append(entity_id)
+
+        visited_entities = set()
+        candidates: Dict[str, Dict[str, Any]] = {}
+        anchor_set = set(anchor_fact_ids)
+
+        for hop in range(1, max_hops + 1):
+            next_frontier: List[str] = []
+            for entity_id in frontier:
+                if entity_id in visited_entities:
+                    continue
+                visited_entities.add(entity_id)
+                state = entity_state[entity_id]
+                relations = await self._relations_touching_entity(
+                    entity_id,
+                    tenant_keys=tenant_keys,
+                    user_ids=user_ids,
+                    as_of=as_of,
+                    max_degree=max_degree,
+                )
+                for relation in relations:
+                    edge = {
+                        "assertion_id": relation["assertion_id"],
+                        "subject": relation["subject"],
+                        "predicate": relation["predicate"],
+                        "object": relation["object"],
+                        "fact_id": relation["fact_id"],
+                    }
+                    path = list(state["path"]) + [edge]
+                    path_confidence = min(
+                        float(state.get("confidence", 1.0)),
+                        float(relation["confidence"]),
+                    )
+                    fact_id = str(relation["fact_id"] or "")
+                    if fact_id and fact_id not in anchor_set:
+                        previous = candidates.get(fact_id)
+                        candidate = {
+                            "fact_id": fact_id,
+                            "anchor_fact_id": state.get("anchor_fact_id", ""),
+                            "origin": state.get("origin", ""),
+                            "hop": hop,
+                            "confidence": path_confidence,
+                            "path": path,
+                        }
+                        if (
+                            previous is None
+                            or hop < previous["hop"]
+                            or (
+                                hop == previous["hop"]
+                                and candidate["confidence"] > previous["confidence"]
+                            )
+                        ):
+                            candidates[fact_id] = candidate
+
+                    other_id = (
+                        relation["object_id"]
+                        if relation["subject_id"] == entity_id
+                        else relation["subject_id"]
+                    )
+                    other_norm = (
+                        relation["object_normalized"]
+                        if relation["subject_id"] == entity_id
+                        else relation["subject_normalized"]
+                    )
+                    if (
+                        other_id not in visited_entities
+                        and other_norm not in {"__user__", "__agent__"}
+                    ):
+                        old_state = entity_state.get(other_id)
+                        if old_state is None or len(path) < len(old_state["path"]):
+                            entity_state[other_id] = {
+                                "path": path,
+                                "confidence": path_confidence,
+                                "anchor_fact_id": state.get("anchor_fact_id", ""),
+                                "origin": state.get("origin", ""),
+                            }
+                        next_frontier.append(other_id)
+            frontier = list(dict.fromkeys(next_frontier))
+            if not frontier:
+                break
+
+        ordered = sorted(
+            candidates.values(),
+            key=lambda item: (item["hop"], -item["confidence"], item["fact_id"]),
+        )
+        return ordered[:max_facts]
 
     # ================================================================
     # 图检索
@@ -1535,11 +2539,29 @@ class KuzuGraphStore(GraphStoreBase):
             mc = mem_rows[0][0] if mem_rows else 0
             uc = user_rows[0][0] if user_rows else 0
 
+            entity_count = assertion_count = active_assertion_count = episode_count = 0
+            if self._graphrag_available:
+                entity_rows = await self._run("MATCH (e:Entity) RETURN count(e);")
+                assertion_rows = await self._run("MATCH (a:Assertion) RETURN count(a);")
+                active_rows = await self._run(
+                    "MATCH (a:Assertion) WHERE a.status = 'active' RETURN count(a);"
+                )
+                episode_rows = await self._run("MATCH (e:EpisodeRef) RETURN count(e);")
+                entity_count = entity_rows[0][0] if entity_rows else 0
+                assertion_count = assertion_rows[0][0] if assertion_rows else 0
+                active_assertion_count = active_rows[0][0] if active_rows else 0
+                episode_count = episode_rows[0][0] if episode_rows else 0
+
             return {
                 "backend": "kuzu",
                 "db_path": self._db_path,
                 "memory_nodes": mc,
                 "user_nodes": uc,
+                "graphrag_available": self._graphrag_available,
+                "entity_nodes": entity_count,
+                "assertion_nodes": assertion_count,
+                "active_assertions": active_assertion_count,
+                "episode_refs": episode_count,
             }
         except Exception as e:
             return {"backend": "kuzu", "error": str(e)}

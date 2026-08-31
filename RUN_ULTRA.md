@@ -67,12 +67,33 @@ cd D:\hy-memory
 
 完整结果写入 `results/ultra-smoke-时间戳.json`。
 
+## 4. GraphRAG Shadow 验证
+
+GraphRAG 关系是在新对话写入时从 L1 候选中产生的，因此请使用一个新的
+`MEMORY_DATA_DIR / MEMORY_PERSIST_DIR / MEMORY_GRAPH_DB_PATH`，重新写入评测对话。
+不要直接拿旧的 500 题 runtime 测试，因为其中已有 L2 没有 Entity-Fact 关系。
+
+第一轮建议：
+
+```env
+MEMORY_GRAPHRAG_ENABLED=true
+MEMORY_GRAPHRAG_SHADOW_MODE=true
+MEMORY_GRAPHRAG_MAX_HOPS=2
+MEMORY_GRAPHRAG_MAX_FACTS=5
+MEMORY_GRAPHRAG_MAX_DEGREE=25
+MEMORY_GRAPHRAG_MIN_CONFIDENCE=0.8
+```
+
+Shadow 模式会在 `response.extra.graphrag` 和 `READ_GRAPH_RAG` trace 中记录图路径，
+但不会把图证据加入回答。人工抽检关系准确率后，将
+`MEMORY_GRAPHRAG_SHADOW_MODE=false` 才会让补充 L2 事实参与重排与回答。
+
 ## 已知提示
 
-Hy-Memory 1.2.21 的单客户端关闭流程没有取消 MetricsCollector 的两个后台协程，进程退出时可能打印：
+当前代码会在客户端关闭时取消并等待 MetricsCollector 后台协程。如果进程退出时再次出现：
 
 ```text
 Task was destroyed but it is pending!
 ```
 
-当前验证中这不会导致退出码失败或数据丢失，属于发布包的关闭清理问题，不代表 Ultra 初始化失败。
+说明关闭清理出现了回归，应保留完整日志并运行回归测试，不应再把它视为正常提示。

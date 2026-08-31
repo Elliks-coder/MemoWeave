@@ -129,7 +129,14 @@ class MemAgent:
         # 初始化子智能体（传入 llm_config 以支持各场景 max_tokens 配置）
         llm_config = self.config.llm
         self.summarizer = Summarizer(self.llm_provider, llm_config)
-        self.extractor = Extractor(self.llm_provider, llm_config)
+        graph_config = getattr(self.config, "graph_store", None)
+        self.extractor = Extractor(
+            self.llm_provider,
+            llm_config,
+            graph_relations_enabled=bool(
+                getattr(graph_config, "graphrag_enabled", False)
+            ),
+        )
         self.reflector = Reflector(self.llm_provider, llm_config)
         
         logger.debug("MemAgent initialized")

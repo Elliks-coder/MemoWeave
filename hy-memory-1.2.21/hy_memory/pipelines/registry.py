@@ -102,6 +102,7 @@ class ComponentFactory:
             config=self.config,
             embed_service=self._get_shared_embed_service(),
             vector_store=self._get_shared_vector_store(),
+            graph_store=self._shared_graph_store,
             cache=self._shared_cache,
         )
         await writer.initialize()

@@ -616,6 +616,46 @@ Rules:
 Output the JSON now."""
 
 
+GRAPH_RELATION_SYSTEM_PROMPT_EN = """
+
+---
+
+# ENTITY RELATIONS FOR GRAPH MEMORY
+
+When GraphRAG relation extraction is enabled, add a `relations` array to every
+`memory` item. A relation is only valid when the NEW messages explicitly state
+the relationship. Co-occurrence, topical similarity, guessed social ties and
+facts seen only in Last k Messages are not relations.
+
+Each relation must contain:
+
+* `subject` and `object`: self-contained canonical entity names, never an
+  unresolved pronoun;
+* `subject_type` and `object_type`: person, place, organization, event,
+  product, activity, animal, concept or other;
+* `predicate`: one of KNOWS, FRIEND_OF, PARTNER_OF, FAMILY_OF, PARENT_OF,
+  CHILD_OF, SIBLING_OF, COLLEAGUE_OF, WORKS_AT, STUDIES_AT, MEMBER_OF,
+  LIVES_IN, FROM, LOCATED_IN, LIKES, DISLIKES, OWNS, USES, CREATED,
+  PARTICIPATED_IN, ATTENDED, VISITED, HAS_PET, CARES_FOR, INTERESTED_IN,
+  LEARNING or RELATED_TO;
+* `confidence`: 0 to 1;
+* `evidence_type`: always `explicit`. Omit inferred relations.
+
+Use `The user` as the subject when the relation is about the user. Use an empty
+array when the memory contains attributes or events but no useful entity link.
+"""
+
+
+GRAPH_RELATION_OUTPUT_PROMPT_EN = """
+
+GraphRAG extension: every object in `memory` must include `relations`.
+Example: `{"relations":[{"subject":"The user","subject_type":"person",
+"predicate":"COLLEAGUE_OF","object":"Lin","object_type":"person",
+"confidence":0.95,"evidence_type":"explicit"}]}`.
+Use `"relations": []` when no explicit entity relationship exists.
+"""
+
+
 # ================================================================
 # 核心实现
 # ================================================================
@@ -632,9 +672,11 @@ class Extractor:
         self,
         llm_provider: LLMProvider,
         llm_config: Optional[GlobalLLMConfig] = None,
+        graph_relations_enabled: bool = False,
     ):
         self.llm = llm_provider
         self._llm_config = llm_config or GlobalLLMConfig()
+        self._graph_relations_enabled = bool(graph_relations_enabled)
         self._call_count = 0
         self._total_tokens = 0
         logger.info("Extractor V2 initialized")
@@ -711,6 +753,8 @@ class Extractor:
                     EXTRACT_PROMPT_ZH,
                     EXTRACT_SYSTEM_PROMPT_ZH,
                     EXTRACT_FEW_SHOT_ZH,
+                    GRAPH_RELATION_OUTPUT_PROMPT_ZH,
+                    GRAPH_RELATION_SYSTEM_PROMPT_ZH,
                 )
 
                 _custom_sys = getattr(
@@ -729,6 +773,9 @@ class Extractor:
                     memory_at=_memory_at,
                     last_messages=_last_messages,
                 )
+                if self._graph_relations_enabled:
+                    system_prompt += GRAPH_RELATION_SYSTEM_PROMPT_ZH
+                    prompt += GRAPH_RELATION_OUTPUT_PROMPT_ZH
             else:
                 _custom_sys = getattr(
                     self._llm_config, "extract_system_prompt_en", None
@@ -745,6 +792,9 @@ class Extractor:
                     memory_at=_memory_at,
                     last_messages=_last_messages,
                 )
+                if self._graph_relations_enabled:
+                    system_prompt += GRAPH_RELATION_SYSTEM_PROMPT_EN
+                    prompt += GRAPH_RELATION_OUTPUT_PROMPT_EN
 
             # 累计 token 统计
             logger.debug(f"[extractor] user prompt: {prompt!r}")

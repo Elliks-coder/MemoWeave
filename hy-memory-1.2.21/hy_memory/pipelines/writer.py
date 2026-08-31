@@ -203,11 +203,13 @@ class MemoryWriter(WritePipeline):
         config: MemoryConfig,
         embed_service: Optional[EmbedService] = None,
         vector_store: Optional[VectorStoreBase] = None,
+        graph_store: Optional[Any] = None,
         cache=None,
     ):
         self.config = config
         self._embed_service = embed_service
         self._external_vector_store = vector_store
+        self._graph_store = graph_store
         self._cache = cache
 
         self._merger: Optional[Merger] = None
@@ -619,6 +621,7 @@ class MemoryWriter(WritePipeline):
                 "layer": "L2_FACT",
                 "tags": item.get("tags") or [],
                 "owner": _norm_owner(item.get("owner")),
+                "relations": list(item.get("relations") or []),
                 "source_turn_ids": list(item.get("source_turn_ids") or []),
                 "source_turn_indices": list(item.get("source_turn_indices") or []),
                 **_copy_temporal_meta(item),
@@ -638,6 +641,7 @@ class MemoryWriter(WritePipeline):
                 "layer": "L2_FACT",
                 "tags": item.get("tags") or [],
                 "owner": _norm_owner(item.get("owner")),
+                "relations": list(item.get("relations") or []),
                 "source_turn_ids": list(item.get("source_turn_ids") or []),
                 "source_turn_indices": list(item.get("source_turn_indices") or []),
                 **_copy_temporal_meta(item),
@@ -908,6 +912,56 @@ class MemoryWriter(WritePipeline):
         supersede_cnt = 0     # SUPERSEDE（矛盾演化）
         update_cnt = 0        # UPDATE（合并精炼）
         apply_errors: List[str] = []
+        graph_counts = {"published": 0, "rejected": 0, "failures": 0}
+
+        async def _publish_graph(
+            fact_node: MemoryNode,
+            op: Any,
+            supersedes_fact_ids: Optional[List[str]] = None,
+        ) -> None:
+            """把本 op 对齐到的显式候选关系发布到可信 L2 图。"""
+            graph_config = getattr(self.config, "graph_store", None)
+            if not getattr(graph_config, "graphrag_enabled", False):
+                return
+            from ._retrieval.graphrag import (
+                collect_relations_for_op,
+                publish_l2_fact_relations,
+            )
+
+            relations = collect_relations_for_op(
+                op,
+                new_memories_meta,
+                min_confidence=float(
+                    getattr(graph_config, "graphrag_min_confidence", 0.8)
+                ),
+            )
+            if not relations and not supersedes_fact_ids:
+                return
+            try:
+                summary = await publish_l2_fact_relations(
+                    graph_store=self._graph_store,
+                    fact_node=fact_node,
+                    relations=relations,
+                    supersedes_fact_ids=supersedes_fact_ids or [],
+                )
+            except Exception as graph_error:
+                graph_counts["failures"] += 1
+                logger.warning(
+                    "[graphrag-write] unexpected publish error for fact=%s: %s",
+                    fact_node.node_id,
+                    graph_error,
+                    exc_info=True,
+                )
+                return
+            graph_counts["published"] += int(summary.get("published") or 0)
+            graph_counts["rejected"] += int(summary.get("rejected") or 0)
+            if not summary.get("success"):
+                graph_counts["failures"] += 1
+                logger.warning(
+                    "[graphrag-write] publish failed for fact=%s: %s",
+                    fact_node.node_id,
+                    summary.get("errors") or summary.get("error") or "unknown",
+                )
 
         for op_idx, op in enumerate(recon_result.ops):
             op_turn_ids, op_turn_indices = self._op_provenance(op, new_memories_meta)
@@ -1104,6 +1158,9 @@ class MemoryWriter(WritePipeline):
                         continue
                     stored_ids.append(target_id)
                     update_cnt += 1
+                    updated_graph_node = await vector_store.get_by_id(target_id)
+                    if updated_graph_node is not None:
+                        await _publish_graph(updated_graph_node, op)
                     await self._emit_reconcile_apply(
                         request, vector_store=vector_store, op_type="UPDATE",
                         memory_id=target_id, layer=layer.value, content=content,
@@ -1260,6 +1317,11 @@ class MemoryWriter(WritePipeline):
                     supersedes=[target_id],
                 )
                 await self._maybe_index_entities(vector_store, new_node, request)
+                await _publish_graph(
+                    new_node,
+                    op,
+                    supersedes_fact_ids=[target_id],
+                )
 
                 supersede_cnt += 1
 
@@ -1340,6 +1402,7 @@ class MemoryWriter(WritePipeline):
                 memory_id=nid, layer=layer.value, content=content,
             )
             await self._maybe_index_entities(vector_store, new_node, request)
+            await _publish_graph(new_node, op)
             logger.debug(
                 f"[reconciler] ADD: {content[:80]} → node_id={nid} "
                 f"layer={layer.value} reason={op.reason}"
@@ -1388,6 +1451,9 @@ class MemoryWriter(WritePipeline):
                     "failed_ops": len(apply_errors),
                     "errors": apply_errors,
                     "new_memories_input": len(new_memory_texts),
+                    "graph_published": graph_counts["published"],
+                    "graph_rejected": graph_counts["rejected"],
+                    "graph_failures": graph_counts["failures"],
                 }
                 await self._cache.store_pipeline_log(
                     request_id=req_id,
@@ -1408,6 +1474,9 @@ class MemoryWriter(WritePipeline):
             "supersede": supersede_cnt,
             "update": update_cnt,
             "total": add_cnt + supersede_cnt + update_cnt,
+            "graph_published": graph_counts["published"],
+            "graph_rejected": graph_counts["rejected"],
+            "graph_failures": graph_counts["failures"],
         }
         recon_tokens = {
             "prompt": recon_result.prompt_tokens,
@@ -1431,6 +1500,7 @@ class MemoryWriter(WritePipeline):
         不做去重/合并/演化，保留所有提取结果。
         """
         stored_ids: List[str] = []
+        graph_counts = {"published": 0, "rejected": 0, "failures": 0}
 
         # 批量 embed
         contents = [m.get("content", "") for m in new_memories_meta if m.get("content")]
@@ -1479,10 +1549,54 @@ class MemoryWriter(WritePipeline):
                 memory_id=nid, layer=layer.value, content=content,
             )
             await self._maybe_index_entities(vector_store, new_node, request)
+            graph_config = getattr(self.config, "graph_store", None)
+            if getattr(graph_config, "graphrag_enabled", False):
+                from ..models.graph_memory import sanitize_relation_candidates
+                from ._retrieval.graphrag import publish_l2_fact_relations
+
+                relations = sanitize_relation_candidates(
+                    meta.get("relations") or [],
+                    source_turn_ids=meta.get("source_turn_ids") or [],
+                    min_confidence=float(
+                        getattr(graph_config, "graphrag_min_confidence", 0.8)
+                    ),
+                )
+                if relations:
+                    try:
+                        graph_summary = await publish_l2_fact_relations(
+                            graph_store=self._graph_store,
+                            fact_node=new_node,
+                            relations=relations,
+                        )
+                    except Exception as graph_error:
+                        graph_counts["failures"] += 1
+                        logger.warning(
+                            "[graphrag-write] direct publish failed for fact=%s: %s",
+                            new_node.node_id,
+                            graph_error,
+                            exc_info=True,
+                        )
+                        continue
+                    graph_counts["published"] += int(
+                        graph_summary.get("published") or 0
+                    )
+                    graph_counts["rejected"] += int(
+                        graph_summary.get("rejected") or 0
+                    )
+                    if not graph_summary.get("success"):
+                        graph_counts["failures"] += 1
 
         logger.info(f"[direct_store] stored {len(stored_ids)} nodes (reconcile disabled)")
         n = len(stored_ids)
-        return stored_ids, None, {"add": n, "supersede": 0, "update": 0, "total": n}, {"prompt": 0, "completion": 0, "total": 0}
+        return stored_ids, None, {
+            "add": n,
+            "supersede": 0,
+            "update": 0,
+            "total": n,
+            "graph_published": graph_counts["published"],
+            "graph_rejected": graph_counts["rejected"],
+            "graph_failures": graph_counts["failures"],
+        }, {"prompt": 0, "completion": 0, "total": 0}
 
     async def _store_summary(
         self,

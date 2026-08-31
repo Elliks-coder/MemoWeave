@@ -402,6 +402,15 @@ class GraphStoreConfig:
     password: str = None  # Neo4j/Memgraph 密码
     database: str = None  # Neo4j 数据库名
 
+    # Entity-Fact GraphRAG（L1 候选关系 → L2 审核发布）。默认关闭，避免在
+    # 完成 A/B 验证前改变既有检索基线；启用后默认 shadow，只记录图扩展结果。
+    graphrag_enabled: bool = False
+    graphrag_shadow_mode: bool = True
+    graphrag_max_hops: int = 2
+    graphrag_max_facts: int = 5
+    graphrag_max_degree: int = 25
+    graphrag_min_confidence: float = 0.8
+
     def __post_init__(self):
         if self.provider is None:
             self.provider = os.getenv("MEMORY_GRAPH_PROVIDER", "kuzu")
@@ -424,6 +433,23 @@ class GraphStoreConfig:
             )
         if self.database is None:
             self.database = os.getenv("NEO4J_DATABASE", "neo4j")
+        self.graphrag_enabled = _get_env_bool("MEMORY_GRAPHRAG_ENABLED", False)
+        self.graphrag_shadow_mode = _get_env_bool(
+            "MEMORY_GRAPHRAG_SHADOW_MODE", True
+        )
+        self.graphrag_max_hops = max(
+            1, min(2, _get_env_int("MEMORY_GRAPHRAG_MAX_HOPS", 2))
+        )
+        self.graphrag_max_facts = max(
+            1, _get_env_int("MEMORY_GRAPHRAG_MAX_FACTS", 5)
+        )
+        self.graphrag_max_degree = max(
+            1, _get_env_int("MEMORY_GRAPHRAG_MAX_DEGREE", 25)
+        )
+        self.graphrag_min_confidence = max(
+            0.0,
+            min(1.0, _get_env_float("MEMORY_GRAPHRAG_MIN_CONFIDENCE", 0.8)),
+        )
 
 
 @dataclass
@@ -769,6 +795,12 @@ class MemoryConfig:
                 "db_path": self.graph_store.db_path,
                 "url": self.graph_store.url,
                 "database": self.graph_store.database,
+                "graphrag_enabled": self.graph_store.graphrag_enabled,
+                "graphrag_shadow_mode": self.graph_store.graphrag_shadow_mode,
+                "graphrag_max_hops": self.graph_store.graphrag_max_hops,
+                "graphrag_max_facts": self.graph_store.graphrag_max_facts,
+                "graphrag_max_degree": self.graph_store.graphrag_max_degree,
+                "graphrag_min_confidence": self.graph_store.graphrag_min_confidence,
             },
             "cache": {
                 "backend": self.cache.backend,

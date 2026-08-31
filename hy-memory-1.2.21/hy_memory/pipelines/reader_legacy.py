@@ -15,7 +15,7 @@ Legacy Read Pipeline.
 演化链回溯。L4_IDENTITY 按普通记忆走 normal 路（不算 profile）。
 """
 
-from typing import Any, Optional, List
+from typing import Any, Dict, Optional, List
 from datetime import datetime
 import logging
 import os
@@ -503,6 +503,92 @@ class LegacyReadPipeline(ReadPipeline):
                         ),
                     }
 
+                    # Entity-Fact GraphRAG：以向量命中的 L2 和 query 中明确实体为
+                    # 种子，受限扩展最多两跳，再按 FactRef 回到 VDB 读取证据原文。
+                    graph_config = getattr(self.config, "graph_store", None)
+                    graphrag_enabled = bool(
+                        getattr(graph_config, "graphrag_enabled", False)
+                    )
+                    graphrag_shadow = bool(
+                        getattr(graph_config, "graphrag_shadow_mode", True)
+                    )
+                    graph_summary: Dict[str, Any] = {
+                        "available": self._graph_store is not None,
+                        "anchor_fact_ids": [],
+                        "candidate_count": 0,
+                        "evidence_count": 0,
+                        "added_count": 0,
+                        "paths": [],
+                    }
+                    _graph_started = datetime.now()
+                    if graphrag_enabled and self._graph_store is not None:
+                        try:
+                            from ._retrieval.graphrag import expand_graph_evidence
+
+                            graph_agent_ids = list(agent_ids or [])
+                            if not graph_agent_ids and request.agent_id:
+                                graph_agent_ids = [request.agent_id]
+                            graph_tenant_keys = [
+                                f"{uid}::{agent}"
+                                for uid in user_ids
+                                for agent in graph_agent_ids
+                            ]
+                            graph_hits, graph_summary = await expand_graph_evidence(
+                                graph_store=self._graph_store,
+                                vector_store=vector_store,
+                                query=request.query,
+                                normal_results=normal_results,
+                                tenant_keys=graph_tenant_keys,
+                                user_ids=user_ids,
+                                as_of=request.as_of,
+                                max_hops=int(
+                                    getattr(graph_config, "graphrag_max_hops", 2)
+                                ),
+                                max_facts=int(
+                                    getattr(graph_config, "graphrag_max_facts", 5)
+                                ),
+                                max_degree=int(
+                                    getattr(graph_config, "graphrag_max_degree", 25)
+                                ),
+                            )
+                            graph_summary["available"] = True
+                            graph_summary["added_count"] = (
+                                0 if graphrag_shadow else len(graph_hits)
+                            )
+                            if not graphrag_shadow:
+                                normal_results.extend(graph_hits)
+                                normal_results.sort(
+                                    key=lambda item: item.get("score", 0.0),
+                                    reverse=True,
+                                )
+                        except Exception as graph_error:
+                            graph_summary = {
+                                **graph_summary,
+                                "available": False,
+                                "error": f"{type(graph_error).__name__}: {graph_error}",
+                            }
+                            logger.warning(
+                                "[graphrag-read] expansion failed: %s", graph_error,
+                                exc_info=True,
+                            )
+                    elif graphrag_enabled:
+                        graph_summary["error"] = "graph store was not injected"
+
+                    response.extra["graphrag"] = {
+                        "enabled": graphrag_enabled,
+                        "shadow_mode": graphrag_shadow,
+                        **graph_summary,
+                    }
+                    await trace_log.log_graph_rag(
+                        query=request.query,
+                        enabled=graphrag_enabled,
+                        shadow_mode=graphrag_shadow,
+                        summary=graph_summary,
+                        elapsed_ms=(
+                            datetime.now() - _graph_started
+                        ).total_seconds() * 1000,
+                    )
+
                     if profile_limit > 0:
                         # ── Profile 配额分配：identity 40% / schema 40% / 自由竞争 20% ──
                         # 不能简单按 score 截断，否则高分 L6 会挤掉全部 L4。
@@ -691,6 +777,18 @@ class LegacyReadPipeline(ReadPipeline):
                             **memory_temporal_fields(node),
                             **memory_provenance_fields(node),
                         }
+                        if result_item.get("graph_added"):
+                            mem_entry.update({
+                                "retrieval_source": "entity_fact_graph",
+                                "graph_hop": result_item.get("graph_hop"),
+                                "graph_anchor_fact_id": result_item.get(
+                                    "graph_anchor_fact_id", ""
+                                ),
+                                "graph_confidence": result_item.get(
+                                    "graph_confidence"
+                                ),
+                                "graph_path": result_item.get("graph_path") or [],
+                            })
                         # schema_type: basic/abstract (仅 L6_SCHEMA 有)
                         _custom = getattr(node, "custom", None) or {} if node else {}
                         _st = _custom.get("schema_type", "")

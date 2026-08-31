@@ -226,6 +226,44 @@ class GraphStoreBase(ABC):
         """
         return []  # 默认 no-op
 
+    # ================================================================
+    # Entity-Fact GraphRAG
+    # ================================================================
+
+    async def publish_fact_relations(
+        self,
+        fact_node: MemoryNode,
+        relations: List[Dict[str, Any]],
+        supersedes_fact_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """把经 L2 reconcile 确认的关系发布为 active assertions。
+
+        不支持 Entity-Fact GraphRAG 的后端必须明确返回 available=False，调用层
+        据此记录真实降级状态，不能把 no-op 误报为成功。
+        """
+        return {
+            "available": False,
+            "success": False,
+            "published": 0,
+            "rejected": len(relations or []),
+            "error": f"{type(self).__name__} does not support fact relations",
+        }
+
+    async def expand_fact_relations(
+        self,
+        *,
+        anchor_fact_ids: List[str],
+        query: str,
+        tenant_keys: Optional[List[str]] = None,
+        user_ids: Optional[List[str]] = None,
+        as_of: Optional[Any] = None,
+        max_hops: int = 2,
+        max_facts: int = 5,
+        max_degree: int = 25,
+    ) -> List[Dict[str, Any]]:
+        """从向量事实和 query 实体出发，返回受限多跳补充事实及路径。"""
+        return []
+
     async def list_schema_embeddings(
         self,
         isolation_key: str,

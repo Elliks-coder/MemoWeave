@@ -342,6 +342,43 @@ EXTRACT_PROMPT_ZH = """## 最近 k 条消息
 现在请输出JSON内容"""
 
 
+GRAPH_RELATION_SYSTEM_PROMPT_ZH = """
+
+---
+
+# 用于图记忆的实体关系
+
+启用 GraphRAG 关系抽取时，每个 `memory` 条目都要增加 `relations` 数组。
+关系必须由 NEW messages 明确陈述；仅在同一段出现、主题相近、猜测出的社交
+关系，以及只存在于 Last k Messages 的事实，都不能作为关系。
+
+每条关系必须包含：
+
+* `subject`、`object`：可独立理解的规范实体名称，不能使用未消解的代词；
+* `subject_type`、`object_type`：person、place、organization、event、
+  product、activity、animal、concept 或 other；
+* `predicate`：只能使用 KNOWS、FRIEND_OF、PARTNER_OF、FAMILY_OF、
+  PARENT_OF、CHILD_OF、SIBLING_OF、COLLEAGUE_OF、WORKS_AT、STUDIES_AT、
+  MEMBER_OF、LIVES_IN、FROM、LOCATED_IN、LIKES、DISLIKES、OWNS、USES、
+  CREATED、PARTICIPATED_IN、ATTENDED、VISITED、HAS_PET、CARES_FOR、
+  INTERESTED_IN、LEARNING 或 RELATED_TO；
+* `confidence`：0 到 1；
+* `evidence_type`：固定为 `explicit`，不要输出推断关系。
+
+关系涉及用户本人时统一使用“用户”。没有明确且有价值的实体连接时输出空数组。
+"""
+
+
+GRAPH_RELATION_OUTPUT_PROMPT_ZH = """
+
+GraphRAG 扩展：`memory` 中的每个对象都必须包含 `relations`。
+示例：`{"relations":[{"subject":"用户","subject_type":"person",
+"predicate":"COLLEAGUE_OF","object":"小林","object_type":"person",
+"confidence":0.95,"evidence_type":"explicit"}]}`。
+没有明确实体关系时使用 `"relations": []`。
+"""
+
+
 # ================================================================
 # EXTRACT FEW-SHOT 示例（中文版）
 # ================================================================

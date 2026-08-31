@@ -59,6 +59,7 @@ STEP_READ_RECALL_PROFILE    = "READ_RECALL_PROFILE"    # Profile 路召回
 STEP_READ_KEYWORD_EMBED     = "READ_KEYWORD_EMBED"     # 路 B：keyword batch embed
 STEP_READ_TAG_MATCH         = "READ_TAG_MATCH"         # 路 B：tag_index 相似度匹配
 STEP_READ_RECALL_TAG        = "READ_RECALL_TAG"        # 路 B：tag filter 向量召回
+STEP_READ_GRAPH_RAG         = "READ_GRAPH_RAG"         # Entity-Fact 图扩展与证据回查
 
 # 融合 / 排序 / 合成
 STEP_READ_BM25          = "READ_BM25"             # 路 C：BM25 重排
@@ -429,6 +430,33 @@ class ReadTraceLogger:
             response=_safe_json({"count": len(hits), "top": preview[:5]}),
             parsed=parsed,
             memory_ids=[h.get("node_id", "") for h in hits if h.get("node_id")],
+            elapsed_ms=elapsed_ms,
+        )
+
+    async def log_graph_rag(
+        self,
+        *,
+        query: str,
+        enabled: bool,
+        shadow_mode: bool,
+        summary: Dict[str, Any],
+        elapsed_ms: float = 0.0,
+    ) -> None:
+        payload = {
+            "enabled": bool(enabled),
+            "shadow_mode": bool(shadow_mode),
+            **dict(summary or {}),
+        }
+        await self._write(
+            STEP_READ_GRAPH_RAG,
+            prompt=query or "",
+            response=_safe_json(payload),
+            parsed=payload,
+            memory_ids=[
+                str(path.get("fact_id"))
+                for path in (payload.get("paths") or [])
+                if str(path.get("fact_id") or "")
+            ],
             elapsed_ms=elapsed_ms,
         )
 

@@ -85,6 +85,7 @@ class System2Writer(WritePipeline):
             config=self.config,
             embed_service=self._embed_service,
             vector_store=self._vector_store,
+            graph_store=self._graph_store,
             cache=self._cache,
         )
         await self._writer.initialize()

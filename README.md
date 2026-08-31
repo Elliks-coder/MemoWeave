@@ -1,4 +1,4 @@
-# MemoGraph
+# MemoWeave
 
 面向长期陪伴与个人智能助理场景的个人长期记忆系统实验项目。系统将跨会话对话加工为可检索、可演化、可追溯的用户记忆，并建立了覆盖写入、检索、回答和证据溯源的 LoCoMo 评测链路。
 
@@ -6,7 +6,7 @@
 
 - 分层记忆：原始会话、基础画像、原子事实、未来意图和高阶行为 Schema；
 - 快慢双路径：System 1 在线抽取与 reconcile，System 2 跨会话归纳；
-- 混合存储：Chroma 保存语义记忆，Kuzu 保存 L6 Schema 及事实依赖；
+- 混合存储：Chroma 保存语义记忆，Kuzu 保存 L6 Schema、事实依赖与可追溯实体关系；
 - 记忆演化：时间字段、`ADD / UPDATE / SUPERSEDE` 和双向版本链；
 - 可解释检索：L2/L7 保留原始 session / turn provenance；
 - 系统评测：Accuracy、Exact Hit@K、Recall@K、provenance 覆盖率和延迟统计。
@@ -49,9 +49,18 @@ GRAPH_MEMORY_SIMPLE_DESIGN.md GraphRAG 简版设计稿
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-## GraphRAG 方向
+## Entity-Fact GraphRAG
 
-下一阶段将在独立分支中实现实体事实图：由 L1 原始对话抽取候选关系，经 L2 reconcile 审核后发布为可检索关系，并以受限两跳扩展补充 Multi-hop 证据。方案见 [Graph 记忆链路简版设计](GRAPH_MEMORY_SIMPLE_DESIGN.md)。
+`feat/graphrag-memory` 分支实现了实体事实图：由 L1 原始对话抽取显式候选关系，经 L2 reconcile 审核后发布为可信 `Assertion`，再以向量事实/query 实体为种子执行受限两跳扩展，并根据 `FactRef` 回到 Chroma 获取 L2 原文。
+
+默认关闭；建议先启用 Shadow 模式观察路径，不改变回答结果：
+
+```env
+MEMORY_GRAPHRAG_ENABLED=true
+MEMORY_GRAPHRAG_SHADOW_MODE=true
+```
+
+详细数据模型、过滤规则、A/B 指标和启用方式见 [Graph 记忆链路简版设计](GRAPH_MEMORY_SIMPLE_DESIGN.md)。
 
 ## 开源来源与许可
 
